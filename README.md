@@ -12,7 +12,6 @@ This package offers several map implementations tailored for specific needs:
 ## Installation
 
 ```bash
-# (Assuming your module path is github.com/carsongh/strongmap)
 go get github.com/carsongh/strongmap
 ```
 
@@ -38,12 +37,12 @@ func main() {
 
 	// Get a value
 	if val, ok := m.Get("apple"); ok {
-		fmt.Println("Apple count:", val) // Output: Apple count: 1
+		fmt.Println("Apple count:", val)
 	}
 
 	// Check existence
 	if m.Exists("banana") {
-		fmt.Println("Banana exists") // Output: Banana exists
+		fmt.Println("Banana exists")
 	}
 
 	// Delete a key
@@ -51,7 +50,7 @@ func main() {
 
 	// Get a snapshot (copy) of the map
 	snapshot := m.Snapshot()
-	fmt.Printf("Snapshot: %+v\n", snapshot) // Output: Snapshot: map[banana:2]
+	fmt.Printf("Snapshot: %+v\n", snapshot)
 }
 
 ```
@@ -72,14 +71,13 @@ import (
 
 func main() {
 	filePath := "my_persistent_map.data"
-	defer os.Remove(filePath) // Clean up the data file afterwards
 
-	// Create a new persistent map, compacting every minute
-	pm, err := persistentmap.NewPersistentSyncedMap[string, string](filePath, 1*time.Minute)
+	// Create a new persistent map, compacting every hour minimum
+	pm, err := persistentmap.NewPersistentSyncedMap[string, string](filePath, 60*time.Minute)
 	if err != nil {
 		log.Fatalf("Failed to create persistent map: %v", err)
 	}
-	defer pm.Close() // Ensure the map is properly closed
+	defer pm.Close() // Ensure the persisting file is properly closed
 
 	// Set some values
 	err = pm.Set("key1", "value1")
@@ -94,7 +92,7 @@ func main() {
 
 	// Get a value
 	if val, ok := pm.Get("key1"); ok {
-		fmt.Println("Value for key1:", val) // Output: Value for key1: value1
+		fmt.Println("Value for key1:", val)
 	}
 
 	// Delete a key
@@ -104,7 +102,7 @@ func main() {
 	}
 
 
-	// Close the map (writes remaining buffer, stops background tasks)
+	// Close the map persistence file and go operations (writes remaining buffer, stops background tasks)
 	if err := pm.Close(); err != nil {
 		log.Printf("Error closing map: %v", err)
 	}
@@ -117,20 +115,12 @@ func main() {
 	defer pm2.Close()
 
 	if val, ok := pm2.Get("key1"); ok {
-		fmt.Println("Reloaded value for key1:", val) // Output: Reloaded value for key1: value1
+		fmt.Println("Reloaded value for key1:", val)
 	}
 	if _, ok := pm2.Get("key2"); !ok {
-		fmt.Println("Key2 correctly deleted") // Output: Key2 correctly deleted
+		fmt.Println("Key2 correctly deleted")
 	}
 
 
 }
 ```
-
-## Contributing
-
-(TODO: Add contribution guidelines.)
-
-## License
-
-(TODO: Add license information.) 
