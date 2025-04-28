@@ -2,8 +2,10 @@
 
 A Go package providing an implmentation of generic sync maps and persitent generic sync maps using redis like AOF (Append Only File). Use cases are for single instance go monolithic servers that store items in memory but want persistence for restarts.
 
+- Data is stored into GOB data file, so it's not human readable and is only usable by go programs. 
 - This is NOT made for multi-machine scaling usecases
 - This still has a single failure point, if the machine storage is corrupted persitence will be destroyed. 
+
 
 
 ## Description
