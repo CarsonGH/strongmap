@@ -1,10 +1,12 @@
 # strongmap
 
-A Go package providing strongly-typed, generic map implementations with different characteristics.
+A Go package providing an implmentation of generic sync maps and persitent generic sync maps using redis like AOF (Append Only File). Use cases are for single instance go monolithic servers that store items in memory but want persistence for restarts.
+
+- This is NOT made for multi-machine scaling usecases
+- This still has a single failure point, if the machine storage is corrupted persitence will be destroyed. 
+
 
 ## Description
-
-This package offers several map implementations tailored for specific needs:
 
 *   **`concurrentmap.SyncedMap`**: A thread-safe map suitable for concurrent read/write access. It uses a `sync.RWMutex` for synchronization.
 *   **`persistentmap.PersistentSyncedMap`**: A thread-safe map that persists its state to a file. It uses an append-only log for write operations and supports periodic compaction. It builds upon `concurrentmap.SyncedMap` for in-memory storage.
@@ -17,6 +19,7 @@ go get github.com/carsongh/strongmap
 
 ## Usage
 
+(Generic Sync Map)
 ### `concurrentmap.SyncedMap`
 
 ```go
@@ -55,6 +58,7 @@ func main() {
 
 ```
 
+(Persistent Generic Sync Map)
 ### `persistentmap.PersistentSyncedMap`
 
 ```go
