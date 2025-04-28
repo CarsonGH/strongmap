@@ -1,4 +1,4 @@
-package sinker
+package persistentmap
 
 import (
 	"bufio"
