@@ -29,7 +29,7 @@ type PersistentSyncedMap[K comparable, V any] struct {
 	stop           chan struct{}
 	wg             sync.WaitGroup
 	closeOnce      sync.Once
-	Map            *concurrentmap.SyncedMap[K, V]
+	m              *concurrentmap.SyncedMap[K, V]
 	lastCompaction time.Time
 	entryCount     int
 }
@@ -51,7 +51,7 @@ func NewPersistentSyncedMap[K comparable, V any](
 		filePath:       filePath,
 		compactEvery:   compactInterval,
 		stop:           make(chan struct{}),
-		Map:            concurrentmap.NewSyncedMap[K, V](),
+		m:              concurrentmap.NewSyncedMap[K, V](),
 		lastCompaction: now,
 	}
 
@@ -82,8 +82,8 @@ func (p *PersistentSyncedMap[K, V]) Set(key K, val V) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	_, exists := p.Map.Get(key)
-	p.Map.Set(key, val)
+	_, exists := p.m.Get(key)
+	p.m.Set(key, val)
 
 	if !exists {
 		p.entryCount++
@@ -97,9 +97,9 @@ func (p *PersistentSyncedMap[K, V]) Delete(key K) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	_, exists := p.Map.Get(key)
+	_, exists := p.m.Get(key)
 	if exists {
-		p.Map.Delete(key)
+		p.m.Delete(key)
 		p.entryCount--
 		return p.persist(OpDel, key, nil)
 	}
@@ -108,7 +108,12 @@ func (p *PersistentSyncedMap[K, V]) Delete(key K) error {
 
 // Get retrieves a value by key.
 func (p *PersistentSyncedMap[K, V]) Get(key K) (V, bool) {
-	return p.Map.Get(key)
+	return p.m.Get(key)
+}
+
+// Snapshot returns a snapshot of the current map state.
+func (p *PersistentSyncedMap[K, V]) Snapshot() map[K]V {
+	return p.m.Snapshot()
 }
 
 // persist appends an operation to the file.
@@ -150,7 +155,7 @@ func (p *PersistentSyncedMap[K, V]) load() error {
 	f, err := os.Open(p.filePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			p.Map = concurrentmap.NewSyncedMap[K, V]()
+			p.m = concurrentmap.NewSyncedMap[K, V]()
 			p.entryCount = 0
 			return nil
 		}
@@ -158,14 +163,14 @@ func (p *PersistentSyncedMap[K, V]) load() error {
 	}
 	defer f.Close()
 
-	p.Map = concurrentmap.NewSyncedMap[K, V]()
+	p.m = concurrentmap.NewSyncedMap[K, V]()
 	p.entryCount = 0
 	dec := gob.NewDecoder(f)
 
 	var snapshot map[K]V
 	if err = dec.Decode(&snapshot); err == nil {
 		for k, v := range snapshot {
-			p.Map.Set(k, v)
+			p.m.Set(k, v)
 			p.entryCount++
 		}
 	} else {
@@ -213,16 +218,16 @@ func (p *PersistentSyncedMap[K, V]) load() error {
 					}
 					return fmt.Errorf("error decoding value for set key %v: %w", k, err)
 				}
-				_, exists := p.Map.Get(k)
-				p.Map.Set(k, v)
+				_, exists := p.m.Get(k)
+				p.m.Set(k, v)
 				if !exists {
 					p.entryCount++
 				}
 			}
 		case OpDel:
-			_, exists := p.Map.Get(k)
+			_, exists := p.m.Get(k)
 			if exists {
-				p.Map.Delete(k)
+				p.m.Delete(k)
 				p.entryCount--
 			}
 		default:
@@ -256,7 +261,7 @@ func (p *PersistentSyncedMap[K, V]) maintenanceLoop() {
 
 // Compact writes a snapshot of the map to the file.
 func (p *PersistentSyncedMap[K, V]) Compact() error {
-	snapshot := p.Map.Snapshot()
+	snapshot := p.m.Snapshot()
 	tempPath := p.filePath + ".tmp"
 
 	// Write snapshot to temp file
