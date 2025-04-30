@@ -25,6 +25,7 @@ type PersistentSyncedMap[K comparable, V any] struct {
 	filePath       string
 	appendFile     *os.File
 	appendBuf      *bufio.Writer
+	appendEncoder  *gob.Encoder
 	compactEvery   time.Duration
 	stop           chan struct{}
 	wg             sync.WaitGroup
@@ -39,8 +40,7 @@ func NewPersistentSyncedMap[K comparable, V any](
 	filePath string,
 	compactInterval time.Duration,
 ) (*PersistentSyncedMap[K, V], error) {
-	// Register types for gob - we don't need to register pointers now
-	// as we're handling them separately in our persist/load methods
+	// Register types for gob
 	var k K
 	var v V
 	gob.Register(k)
@@ -74,6 +74,7 @@ func (p *PersistentSyncedMap[K, V]) openAppend() error {
 	}
 	p.appendFile = f
 	p.appendBuf = bufio.NewWriter(f)
+	p.appendEncoder = gob.NewEncoder(p.appendBuf)
 	return nil
 }
 
@@ -116,33 +117,31 @@ func (p *PersistentSyncedMap[K, V]) Snapshot() map[K]V {
 	return p.m.Snapshot()
 }
 
-// persist appends an operation to the file.
+// persist appends an operation to the file using the single gob encoder.
 func (p *PersistentSyncedMap[K, V]) persist(op string, key K, valPtr *V) error {
-	if p.appendFile == nil || p.appendBuf == nil {
-		return fmt.Errorf("persist cannot write: append file handle or buffer is nil")
+	if p.appendFile == nil || p.appendBuf == nil || p.appendEncoder == nil {
+		return fmt.Errorf("persist cannot write: append file handle, buffer, or encoder is nil")
 	}
 
-	enc := gob.NewEncoder(p.appendBuf)
-	if err := enc.Encode(op); err != nil {
+	if err := p.appendEncoder.Encode(op); err != nil {
 		return err
 	}
-	if err := enc.Encode(key); err != nil {
+	if err := p.appendEncoder.Encode(key); err != nil {
 		return err
 	}
 
 	// Handle nil pointer case for delete operations
 	if op == OpDel {
-		// For delete operations, we don't need to encode the value,
-		// just encode a boolean to indicate there's no value
-		if err := enc.Encode(false); err != nil {
+		// Encode a boolean to indicate no value
+		if err := p.appendEncoder.Encode(false); err != nil {
 			return err
 		}
 	} else {
-		// For set operations, encode that there is a value followed by the value
-		if err := enc.Encode(true); err != nil {
+		// Encode that there is a value followed by the value
+		if err := p.appendEncoder.Encode(true); err != nil {
 			return err
 		}
-		if err := enc.Encode(*valPtr); err != nil {
+		if err := p.appendEncoder.Encode(*valPtr); err != nil {
 			return err
 		}
 	}
@@ -259,38 +258,88 @@ func (p *PersistentSyncedMap[K, V]) maintenanceLoop() {
 	}
 }
 
-// Compact writes a snapshot of the map to the file.
+// Compact writes a snapshot to a new file and swaps it with the current file.
 func (p *PersistentSyncedMap[K, V]) Compact() error {
-	snapshot := p.m.Snapshot()
-	tempPath := p.filePath + ".tmp"
-
-	// Write snapshot to temp file
-	f, err := os.Create(tempPath)
-	if err != nil {
-		return err
-	}
-	enc := gob.NewEncoder(f)
-	if err = enc.Encode(snapshot); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-
-	// Replace main file with temp file
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Flush current buffer
 	if p.appendBuf != nil {
-		p.appendBuf.Flush()
+		if err := p.appendBuf.Flush(); err != nil {
+			return fmt.Errorf("failed to flush buffer before compaction: %w", err)
+		}
 	}
+
+	// Move current file to temp file
+	tempPath := p.filePath + ".tmp"
+	if err := os.Rename(p.filePath, tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to move current file to temp: %w", err)
+	}
+
+	// Create new file and write snapshot
+	newFile, err := os.Create(p.filePath)
+	if err != nil {
+		// Revert by moving temp file back
+		if err := os.Rename(tempPath, p.filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to create new file and revert temp file: create error: %w, revert error: %v", err, err)
+		}
+		return fmt.Errorf("failed to create new file: %w", err)
+	}
+
+	// Write snapshot to new file
+	newBuf := bufio.NewWriter(newFile)
+	newEnc := gob.NewEncoder(newBuf)
+	snapshot := p.m.Snapshot()
+	if err := newEnc.Encode(snapshot); err != nil {
+		newBuf.Flush()
+		newFile.Close()
+		// Revert by moving temp file back
+		if err := os.Rename(tempPath, p.filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to encode snapshot and revert temp file: encode error: %w, revert error: %v", err, err)
+		}
+		return fmt.Errorf("failed to encode snapshot: %w", err)
+	}
+	if err := newBuf.Flush(); err != nil {
+		newFile.Close()
+		// Revert by moving temp file back
+		if err := os.Rename(tempPath, p.filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to flush new file and revert temp file: flush error: %w, revert error: %v", err, err)
+		}
+		return fmt.Errorf("failed to flush new file: %w", err)
+	}
+	if err := newFile.Close(); err != nil {
+		// Revert by moving temp file back
+		if err := os.Rename(tempPath, p.filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to close new file and revert temp file: close error: %w, revert error: %v", err, err)
+		}
+		return fmt.Errorf("failed to close new file: %w", err)
+	}
+
+	// Close current file and switch to new file
 	if p.appendFile != nil {
-		p.appendFile.Close()
+		if err := p.appendFile.Close(); err != nil {
+			return fmt.Errorf("failed to close current file: %w", err)
+		}
 	}
-	if err := os.Rename(tempPath, p.filePath); err != nil {
-		return err
+	p.appendFile = nil
+	p.appendBuf = nil
+	p.appendEncoder = nil
+
+	// Open new file for appending
+	if err := p.openAppend(); err != nil {
+		// Revert by moving temp file back
+		if err := os.Rename(tempPath, p.filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to open new append file and revert temp file: open error: %w, revert error: %v", err, err)
+		}
+		return fmt.Errorf("failed to open new append file: %w", err)
 	}
-	return p.openAppend()
+
+	// Delete temp file
+	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to delete temp file: %w", err)
+	}
+
+	return nil
 }
 
 // Close stops the maintenance loop and closes the file.
@@ -307,6 +356,9 @@ func (p *PersistentSyncedMap[K, V]) Close() error {
 		if p.appendFile != nil {
 			err = p.appendFile.Close()
 		}
+		p.appendFile = nil
+		p.appendBuf = nil
+		p.appendEncoder = nil
 	})
 	return err
 }
