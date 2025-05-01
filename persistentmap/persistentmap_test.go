@@ -99,7 +99,7 @@ func TestPersistentSyncedMap(t *testing.T) {
 
 		// Check state
 		expected := map[string]int{"a": 10, "c": 30}
-		snap := p.Map.Snapshot()
+		snap := p.m.Snapshot()
 		if !reflect.DeepEqual(snap, expected) {
 			t.Errorf("After compaction and reopen, map = %v; want %v", snap, expected)
 		}
