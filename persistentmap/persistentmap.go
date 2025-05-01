@@ -2,9 +2,12 @@ package persistentmap
 
 import (
 	"bufio"
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -20,12 +23,12 @@ const (
 
 // Operation represents a single action on the map
 type Operation[K, V any] struct {
-	Op    string `json:"op"`
-	Key   K      `json:"key"`
-	Value *V     `json:"value,omitempty"`
+	Op    string
+	Key   K
+	Value *V
 }
 
-// PersistentSyncedMap is a thread-safe map that persists every operation
+// PersistentSyncedMap is a generic, thread-safe map with persistence
 type PersistentSyncedMap[K comparable, V any] struct {
 	mu             sync.Mutex
 	filePath       string
@@ -40,11 +43,17 @@ type PersistentSyncedMap[K comparable, V any] struct {
 	entryCount     int
 }
 
-// NewPersistentSyncedMap sets up a new map with persistence via operation logs
+// NewPersistentSyncedMap creates a new PersistentSyncedMap with the given configuration
 func NewPersistentSyncedMap[K comparable, V any](
 	filePath string,
 	compactInterval time.Duration,
 ) (*PersistentSyncedMap[K, V], error) {
+	// Register types for gob
+	var k K
+	var v V
+	gob.Register(k)
+	gob.Register(v)
+
 	now := time.Now()
 	p := &PersistentSyncedMap[K, V]{
 		filePath:       filePath,
@@ -54,23 +63,18 @@ func NewPersistentSyncedMap[K comparable, V any](
 		lastCompaction: now,
 	}
 
-	// Load existing operations if the file exists
 	if err := p.load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-
-	// Open the file for appending operations
 	if err := p.openAppend(); err != nil {
 		return nil, err
 	}
 
-	// Start the background compaction task
 	p.wg.Add(1)
 	go p.maintenanceLoop()
 	return p, nil
 }
 
-// openAppend opens the file for appending operations
 func (p *PersistentSyncedMap[K, V]) openAppend() error {
 	f, err := os.OpenFile(p.filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -81,7 +85,7 @@ func (p *PersistentSyncedMap[K, V]) openAppend() error {
 	return nil
 }
 
-// Set adds a key-value pair and logs it as a SET operation
+// Set adds or updates a key-value pair and persists the operation
 func (p *PersistentSyncedMap[K, V]) Set(key K, val V) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -96,7 +100,7 @@ func (p *PersistentSyncedMap[K, V]) Set(key K, val V) error {
 	return p.persist(op)
 }
 
-// Delete removes a key and logs it as a DEL operation
+// Delete removes a key and persists the operation
 func (p *PersistentSyncedMap[K, V]) Delete(key K) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -105,7 +109,7 @@ func (p *PersistentSyncedMap[K, V]) Delete(key K) error {
 	if exists {
 		p.m.Delete(key)
 		p.entryCount--
-		op := Operation[K, V]{Op: OpDel, Key: key}
+		op := Operation[K, V]{Op: OpDel, Key: key, Value: nil}
 		return p.persist(op)
 	}
 	return nil
@@ -116,31 +120,36 @@ func (p *PersistentSyncedMap[K, V]) Get(key K) (V, bool) {
 	return p.m.Get(key)
 }
 
-// Snapshot returns the current map state (for compaction or inspection)
+// Snapshot returns a snapshot of the current map state
 func (p *PersistentSyncedMap[K, V]) Snapshot() map[K]V {
 	return p.m.Snapshot()
 }
 
-// persist writes an operation to the file as a JSON line
+// persist appends an operation to the file as a length-prefixed gob blob
 func (p *PersistentSyncedMap[K, V]) persist(op Operation[K, V]) error {
 	if p.appendFile == nil || p.appendBuf == nil {
-		return fmt.Errorf("can’t write: append file or buffer is fucked")
+		return fmt.Errorf("persist cannot write: append file or buffer is nil")
 	}
 
-	data, err := json.Marshal(op)
-	if err != nil {
-		return fmt.Errorf("failed to marshal operation: %w", err)
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(op); err != nil {
+		return fmt.Errorf("failed to encode operation: %w", err)
+	}
+
+	data := buf.Bytes()
+	length := uint32(len(data))
+
+	if err := binary.Write(p.appendBuf, binary.LittleEndian, length); err != nil {
+		return fmt.Errorf("failed to write length prefix: %w", err)
 	}
 	if _, err := p.appendBuf.Write(data); err != nil {
-		return fmt.Errorf("failed to write operation: %w", err)
-	}
-	if _, err := p.appendBuf.WriteString("\n"); err != nil {
-		return fmt.Errorf("failed to write newline: %w", err)
+		return fmt.Errorf("failed to write operation data: %w", err)
 	}
 	return p.appendBuf.Flush()
 }
 
-// load reads the file and replays all operations to rebuild the map
+// load reads the file and reconstructs the map by replaying operations
 func (p *PersistentSyncedMap[K, V]) load() error {
 	f, err := os.Open(p.filePath)
 	if err != nil {
@@ -149,27 +158,43 @@ func (p *PersistentSyncedMap[K, V]) load() error {
 			p.entryCount = 0
 			return nil
 		}
-		return fmt.Errorf("failed to open file %s: %w", p.filePath, err)
+		return fmt.Errorf("failed to open persistence file %s: %w", p.filePath, err)
 	}
 	defer f.Close()
 
 	p.m = concurrentmap.NewSyncedMap[K, V]()
 	p.entryCount = 0
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
+	reader := bufio.NewReader(f)
+	for {
+		var length uint32
+		if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("failed to read length prefix: %w", err)
+		}
+		data := make([]byte, length)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return fmt.Errorf("failed to read operation data: %w", err)
+		}
+		buf := bytes.NewBuffer(data)
+		dec := gob.NewDecoder(buf)
 		var op Operation[K, V]
-		if err := json.Unmarshal([]byte(line), &op); err != nil {
-			return fmt.Errorf("failed to unmarshal operation: %w", err)
+		if err := dec.Decode(&op); err != nil {
+			return fmt.Errorf("failed to decode operation: %w", err)
 		}
 		switch op.Op {
 		case OpSet:
 			if op.Value != nil {
+				_, exists := p.m.Get(op.Key)
 				p.m.Set(op.Key, *op.Value)
-				p.entryCount++
+				if !exists {
+					p.entryCount++
+				}
 			}
 		case OpDel:
-			if _, exists := p.m.Get(op.Key); exists {
+			_, exists := p.m.Get(op.Key)
+			if exists {
 				p.m.Delete(op.Key)
 				p.entryCount--
 			}
@@ -177,13 +202,10 @@ func (p *PersistentSyncedMap[K, V]) load() error {
 			return fmt.Errorf("unknown operation: %s", op.Op)
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading file: %w", err)
-	}
 	return nil
 }
 
-// maintenanceLoop runs periodic compaction
+// maintenanceLoop handles periodic compaction
 func (p *PersistentSyncedMap[K, V]) maintenanceLoop() {
 	if p.compactEvery <= 0 {
 		p.wg.Done()
@@ -204,19 +226,17 @@ func (p *PersistentSyncedMap[K, V]) maintenanceLoop() {
 	}
 }
 
-// Compact rewrites the file with one SET per current key-value pair
+// Compact writes the current state as SET operations to a new file
 func (p *PersistentSyncedMap[K, V]) Compact() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Flush anything pending
 	if p.appendBuf != nil {
 		if err := p.appendBuf.Flush(); err != nil {
-			return fmt.Errorf("failed to flush buffer: %w", err)
+			return fmt.Errorf("failed to flush buffer before compaction: %w", err)
 		}
 	}
 
-	// Write current state to a temp file
 	tempPath := p.filePath + ".tmp"
 	tempFile, err := os.Create(tempPath)
 	if err != nil {
@@ -224,49 +244,44 @@ func (p *PersistentSyncedMap[K, V]) Compact() error {
 	}
 	defer tempFile.Close()
 
-	buf := bufio.NewWriter(tempFile)
+	tempBuf := bufio.NewWriter(tempFile)
 	snapshot := p.m.Snapshot()
 	for k, v := range snapshot {
 		op := Operation[K, V]{Op: OpSet, Key: k, Value: &v}
-		data, err := json.Marshal(op)
-		if err != nil {
-			return fmt.Errorf("failed to marshal operation: %w", err)
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		if err := enc.Encode(op); err != nil {
+			return fmt.Errorf("failed to encode operation: %w", err)
 		}
-		if _, err := buf.Write(data); err != nil {
-			return fmt.Errorf("failed to write operation: %w", err)
+		data := buf.Bytes()
+		length := uint32(len(data))
+		if err := binary.Write(tempBuf, binary.LittleEndian, length); err != nil {
+			return fmt.Errorf("failed to write length prefix: %w", err)
 		}
-		if _, err := buf.WriteString("\n"); err != nil {
-			return fmt.Errorf("failed to write newline: %w", err)
+		if _, err := tempBuf.Write(data); err != nil {
+			return fmt.Errorf("failed to write operation data: %w", err)
 		}
 	}
-	if err := buf.Flush(); err != nil {
+	if err := tempBuf.Flush(); err != nil {
 		return fmt.Errorf("failed to flush temp file: %w", err)
 	}
 	if err := tempFile.Close(); err != nil {
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	// Swap in the new file
-	if err := os.Rename(tempPath, p.filePath); err != nil {
-		return fmt.Errorf("failed to rename temp file: %w", err)
-	}
-
-	// Close and reopen the append file
 	if p.appendFile != nil {
 		if err := p.appendFile.Close(); err != nil {
 			return fmt.Errorf("failed to close current file: %w", err)
 		}
 	}
-	p.appendFile = nil
-	p.appendBuf = nil
-	if err := p.openAppend(); err != nil {
-		return fmt.Errorf("failed to reopen file: %w", err)
+	if err := os.Rename(tempPath, p.filePath); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
 
-	return nil
+	return p.openAppend()
 }
 
-// Close shuts down the map and cleans up
+// Close stops the maintenance loop and closes the file
 func (p *PersistentSyncedMap[K, V]) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
